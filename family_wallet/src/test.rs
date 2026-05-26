@@ -948,20 +948,20 @@ fn test_add_member_already_exists() {
     client.init(&owner, &initial_members);
 
     // Try to add member1 again (they already exist from initialization)
-    let result = client.try_add_family_member(&owner, &member1, &FamilyRole::Admin);
+    let result = client.try_add_member(&owner, &member1, &FamilyRole::Admin, &0);
     assert_eq!(result, Err(Ok(Error::MemberAlreadyExists)));
 
     // Try to add owner (they already exist and are the owner)
-    let result = client.try_add_family_member(&owner, &owner, &FamilyRole::Admin);
+    let result = client.try_add_member(&owner, &owner, &FamilyRole::Admin, &0);
     assert_eq!(result, Err(Ok(Error::MemberAlreadyExists)));
 
     // Add a new member successfully
     let new_member = Address::generate(&env);
-    let result = client.try_add_family_member(&owner, &new_member, &FamilyRole::Member);
+    let result = client.try_add_member(&owner, &new_member, &FamilyRole::Member, &0);
     assert!(result.is_ok());
 
     // Try to add the same new member again
-    let result = client.try_add_family_member(&owner, &new_member, &FamilyRole::Admin);
+    let result = client.try_add_member(&owner, &new_member, &FamilyRole::Admin, &0);
     assert_eq!(result, Err(Ok(Error::MemberAlreadyExists)));
 }
 
