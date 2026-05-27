@@ -2039,6 +2039,25 @@ impl FamilyWallet {
 
     // Owner/Admin only: audit data is privacy-sensitive — reveals who accessed
     // what and when, so Members are excluded from reading the full trail.
+    //
+    // ## Pagination cursor semantics
+    //
+    // `from_index` is the **inclusive** zero-based index of the first entry to
+    // return.  `next_cursor` in the returned page is the index to pass as
+    // `from_index` on the next call.
+    //
+    // **Sentinel value:** when `next_cursor == total` (i.e. equals the length
+    // of the log at the time of the call) there are no more entries.  Callers
+    // MUST stop iterating when `next_cursor >= count` returned by a previous
+    // page, or when the returned page is empty.
+    //
+    // **Clamping rules (no panic on adversarial input):**
+    // - `limit == 0`            → silently promoted to `DEFAULT_AUDIT_PAGE_LIMIT`.
+    // - `limit > MAX_AUDIT_PAGE_LIMIT` → clamped to `MAX_AUDIT_PAGE_LIMIT`.
+    // - `from_index >= total`   → returns an empty page with
+    //                             `next_cursor = total` (end-of-log sentinel).
+    // - `from_index = u32::MAX` → handled by the `>= total` check above; no
+    //                             arithmetic overflow is possible.
     pub fn get_access_audit_page(
         env: Env,
         caller: Address,
@@ -2054,13 +2073,27 @@ impl FamilyWallet {
             .get(&symbol_short!("ACC_AUDIT"))
             .unwrap_or_else(|| Vec::new(&env));
 
+        // Clamp limit: 0 → default, oversized → max.
         let capped_limit = if limit == 0 {
             DEFAULT_AUDIT_PAGE_LIMIT
         } else {
             limit.min(MAX_AUDIT_PAGE_LIMIT)
         };
+
         let total = entries.len();
+
+        // Out-of-range offset: return empty page with end-of-log sentinel so
+        // callers can detect exhaustion without a separate length query.
+        if from_index >= total {
+            return AccessAuditPage {
+                items: Vec::new(&env),
+                next_cursor: total, // sentinel: no more entries
+                count: 0,
+            };
+        }
+
         let mut items = Vec::new(&env);
+        // `i` is bounded by `total` (u32), so no overflow risk.
         let mut i = from_index;
         while i < total && items.len() < capped_limit {
             if let Some(e) = entries.get(i) {
@@ -2069,7 +2102,9 @@ impl FamilyWallet {
             i += 1;
         }
         let count = items.len();
-        let next_cursor = if i < total { i } else { 0 };
+        // `next_cursor == total` is the end-of-log sentinel.
+        // Callers iterate while `next_cursor < total` (or while `count > 0`).
+        let next_cursor = i; // equals `total` when the log is exhausted
         AccessAuditPage {
             items,
             next_cursor,
