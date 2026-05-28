@@ -3262,3 +3262,230 @@ fn test_audit_page_cursor_stable_across_calls() {
         assert_eq!(a.timestamp, b.timestamp);
     }
 }
+
+// ============================================================================
+// Quorum Re-validation Tests
+//
+// Verify that removing members invalidates in-flight proposals that can no
+// longer reach their required signature threshold, and that valid proposals
+// survive when quorum is still achievable after membership changes.
+// ============================================================================
+
+/// Removing the only signer from a pending proposal must invalidate it
+/// immediately by setting expires_at to the current ledger timestamp.
+#[test]
+fn test_remove_sole_signer_invalidates_proposal() {
+    let env = Env::default();
+    env.mock_all_auths();
+    set_ledger_time(&env, 100, 1_000);
+
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let signer = Address::generate(&env);
+
+    client.init(&owner, &vec![&env, signer.clone()]);
+
+    // Configure multisig: threshold=1, only `signer` is authorised.
+    let signers = vec![&env, signer.clone()];
+    client.configure_multisig(&owner, &TransactionType::RoleChange, &1, &signers, &0);
+
+    // Propose a role change — proposal is now in-flight.
+    let tx_id = client.propose_role_change(&owner, &signer, &FamilyRole::Admin);
+    assert!(tx_id > 0);
+
+    // Sanity: proposal is live before removal.
+    let before = client.get_pending_transaction(&tx_id).unwrap();
+    assert!(before.expires_at > 1_000);
+
+    // Remove the sole configured signer.
+    client.remove_family_member(&owner, &signer);
+
+    // The proposal must now be expired (expires_at == ledger timestamp).
+    let after = client.get_pending_transaction(&tx_id).unwrap();
+    assert_eq!(
+        after.expires_at, 1_000,
+        "Proposal must be invalidated (expires_at set to now) after sole signer removed"
+    );
+
+    // Attempting to sign the invalidated proposal must fail.
+    let result = client.try_sign_transaction(&owner, &tx_id);
+    assert!(result.is_err(), "Signing an invalidated proposal must fail");
+}
+
+/// Removing one signer when remaining eligible signers still meet the
+/// threshold must leave the proposal active and signable.
+#[test]
+fn test_remove_one_signer_proposal_survives_when_quorum_still_met() {
+    let env = Env::default();
+    env.mock_all_auths();
+    set_ledger_time(&env, 100, 1_000);
+
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let signer_a = Address::generate(&env);
+    let signer_b = Address::generate(&env);
+    let signer_c = Address::generate(&env);
+
+    client.init(
+        &owner,
+        &vec![&env, signer_a.clone(), signer_b.clone(), signer_c.clone()],
+    );
+
+    // threshold=2, three signers — removing one still leaves two eligible.
+    let signers = vec![&env, signer_a.clone(), signer_b.clone(), signer_c.clone()];
+    client.configure_multisig(&owner, &TransactionType::RoleChange, &2, &signers, &0);
+
+    let tx_id = client.propose_role_change(&owner, &signer_a, &FamilyRole::Admin);
+    assert!(tx_id > 0);
+
+    let original_expiry = client.get_pending_transaction(&tx_id).unwrap().expires_at;
+
+    // Remove signer_c — two eligible signers remain, threshold still reachable.
+    client.remove_family_member(&owner, &signer_c);
+
+    let after = client.get_pending_transaction(&tx_id).unwrap();
+    assert_eq!(
+        after.expires_at, original_expiry,
+        "Proposal expiry must be unchanged when quorum is still achievable"
+    );
+}
+
+/// Batch-removing members that collectively drop eligible signers below the
+/// threshold must invalidate all affected proposals in a single pass.
+#[test]
+fn test_batch_remove_invalidates_proposals_below_quorum() {
+    let env = Env::default();
+    env.mock_all_auths();
+    set_ledger_time(&env, 100, 2_000);
+
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let s1 = Address::generate(&env);
+    let s2 = Address::generate(&env);
+    let s3 = Address::generate(&env);
+
+    client.init(&owner, &vec![&env, s1.clone(), s2.clone(), s3.clone()]);
+
+    // threshold=3 — all three signers required.
+    let signers = vec![&env, s1.clone(), s2.clone(), s3.clone()];
+    client.configure_multisig(&owner, &TransactionType::RoleChange, &3, &signers, &0);
+
+    let tx_id = client.propose_role_change(&owner, &s1, &FamilyRole::Admin);
+    assert!(tx_id > 0);
+
+    // Batch-remove two of the three signers — only one remains, threshold=3 unachievable.
+    let to_remove = vec![&env, s2.clone(), s3.clone()];
+    let removed = client.batch_remove_family_members(&owner, &to_remove);
+    assert_eq!(removed, 2);
+
+    let after = client.get_pending_transaction(&tx_id).unwrap();
+    assert_eq!(
+        after.expires_at, 2_000,
+        "Proposal must be invalidated after batch removal drops eligible signers below threshold"
+    );
+}
+
+/// Signatures from a removed member must be stripped from the proposal.
+/// If the remaining signatures plus remaining eligible signers can still
+/// reach quorum, the proposal stays active.
+#[test]
+fn test_removed_member_signature_stripped_from_proposal() {
+    let env = Env::default();
+    env.mock_all_auths();
+    set_ledger_time(&env, 100, 1_000);
+
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let signer_a = Address::generate(&env);
+    let signer_b = Address::generate(&env);
+
+    client.init(
+        &owner,
+        &vec![&env, signer_a.clone(), signer_b.clone()],
+    );
+
+    // threshold=2, two signers.
+    let signers = vec![&env, signer_a.clone(), signer_b.clone()];
+    client.configure_multisig(&owner, &TransactionType::RoleChange, &2, &signers, &0);
+
+    // signer_a proposes — their signature is automatically added.
+    let tx_id = client.propose_role_change(&signer_a, &signer_a, &FamilyRole::Admin);
+    assert!(tx_id > 0);
+
+    // Verify signer_a's signature is present.
+    let before = client.get_pending_transaction(&tx_id).unwrap();
+    assert_eq!(before.signatures.len(), 1);
+
+    // Remove signer_a — their signature should be stripped and quorum becomes
+    // unachievable (only signer_b remains, threshold=2).
+    client.remove_family_member(&owner, &signer_a);
+
+    let after = client.get_pending_transaction(&tx_id).unwrap();
+    // Signature stripped.
+    assert_eq!(
+        after.signatures.len(),
+        0,
+        "Removed member's signature must be stripped from the proposal"
+    );
+    // Quorum unachievable: 1 eligible signer < threshold 2 → invalidated.
+    assert_eq!(
+        after.expires_at, 1_000,
+        "Proposal must be invalidated when stripped signatures make quorum unreachable"
+    );
+}
+
+/// The public `revalidate_proposals` function must be callable by Owner/Admin,
+/// return the correct invalidation count, and reject calls from regular members.
+#[test]
+fn test_revalidate_proposals_public_entry_point() {
+    let env = Env::default();
+    env.mock_all_auths();
+    set_ledger_time(&env, 100, 5_000);
+
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let signer = Address::generate(&env);
+    let regular = Address::generate(&env);
+
+    client.init(&owner, &vec![&env, signer.clone(), regular.clone()]);
+
+    // Configure with threshold=1, sole signer.
+    let signers = vec![&env, signer.clone()];
+    client.configure_multisig(&owner, &TransactionType::RoleChange, &1, &signers, &0);
+
+    // Create two in-flight proposals.
+    let tx1 = client.propose_role_change(&owner, &signer, &FamilyRole::Admin);
+    let tx2 = client.propose_role_change(&owner, &regular, &FamilyRole::Admin);
+    assert!(tx1 > 0 && tx2 > 0);
+
+    // Manually remove signer from storage without triggering auto-revalidation
+    // by reconfiguring multisig to an empty-ish state isn't possible, so instead
+    // we remove the signer and then call revalidate_proposals explicitly to test
+    // the public entry point independently.
+    client.remove_family_member(&owner, &signer);
+
+    // Both proposals should already be invalidated by remove_family_member.
+    // Call revalidate_proposals again — it should return 0 (nothing new to invalidate).
+    let count = client.revalidate_proposals(&owner);
+    assert_eq!(
+        count, 0,
+        "Re-running revalidation on already-invalidated proposals must return 0"
+    );
+
+    // Regular member must not be able to call revalidate_proposals.
+    let result = client.try_revalidate_proposals(&regular);
+    assert!(
+        result.is_err(),
+        "Regular member must not be allowed to call revalidate_proposals"
+    );
+}
